@@ -772,3 +772,154 @@ Android/裝置上若要 kgdb，要注意 console/串口配置（kgdboc=ttyX,...�
 	5.	日常追問題用 dynamic_debug + ftrace/bpftrace；記憶體/越界用 KASAN/UBSAN。
 
 如果你把你目前模組的檔案結構貼上來，我可以幫你把 mvpu_os.h 再客製化（加 endian、對齊、簡易 bitmap），並給一個可編的 user-space 測試 main + kernel Kbuild。
+
+超好上手版來了！在 Linux 使用者空間用 CMake 開啟 ASan/UBSan/TSan 等 sanitizer，有兩種常見做法：全域開或針對特定 target 開。下面給你「可直接貼上」的模板＋實務細節（GCC/Clang 都適用）。
+
+⸻
+
+1) 最快上手（整個專案都開）
+
+# CMakeLists.txt (建議 CMake ≥ 3.13)
+cmake_minimum_required(VERSION 3.13)
+project(demo C CXX)
+
+option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
+option(ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
+option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)  # 與 ASAN 不能同時用
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  add_compile_options(-g -O1 -fno-omit-frame-pointer)  # 給 sanitizer 友善的堆疊
+  if(ENABLE_ASAN)
+    add_compile_options(-fsanitize=address)
+    add_link_options(-fsanitize=address)
+    # Clang: LSan 隨 ASan 一起；GCC 也一樣，無需額外 -fsanitize=leak
+  endif()
+  if(ENABLE_UBSAN)
+    add_compile_options(-fsanitize=undefined)
+    add_link_options(-fsanitize=undefined)
+  endif()
+  if(ENABLE_TSAN)
+    add_compile_options(-fsanitize=thread)
+    add_link_options(-fsanitize=thread)
+  endif()
+endif()
+
+add_executable(app src/main.cpp)
+
+用法：
+
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_ASAN=ON -DENABLE_UBSAN=ON
+cmake --build build -j
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1 ./build/app
+
+
+⸻
+
+2) 只對「某些 target」開（推薦）
+
+用 INTERFACE library 方式把旗標打包，想給誰就 target_link_libraries() 誰：
+
+# Sanitizers.cmake（你專案裡的可重用模組）
+function(enable_sanitizers iface)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    message(STATUS "Sanitizers disabled: compiler not GCC/Clang")
+    return()
+  endif()
+  add_library(${iface} INTERFACE)
+  target_compile_options(${iface} INTERFACE -g -O1 -fno-omit-frame-pointer)
+  # 選擇組合：ASan + UBSan 是最常見；TSan 請單獨用
+  set(opts "")
+  if(DEFINED SANITIZE AND SANITIZE STREQUAL "asan-ubsan")
+    list(APPEND opts -fsanitize=address -fsanitize=undefined)
+  elseif(DEFINED SANITIZE AND SANITIZE STREQUAL "tsan")
+    list(APPEND opts -fsanitize=thread)
+  endif()
+  target_compile_options(${iface} INTERFACE ${opts})
+  target_link_options(${iface}    INTERFACE ${opts})
+endfunction()
+
+使用：
+
+include(Sanitizers.cmake)
+enable_sanitizers(san)                 # 讀環境變數 SANITIZE=asan-ubsan 或 tsan
+add_executable(tool src/tool.cpp)
+target_link_libraries(tool PRIVATE san)
+
+add_executable(other src/other.cpp)    # 這個不開 sanitizer
+
+執行：
+
+SANITIZE=asan-ubsan cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build
+ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1 UBSAN_OPTIONS=print_stacktrace=1 ./build/tool
+
+
+⸻
+
+3) 進階：CMake Presets + 測試整合（CI 友善）
+
+CMakePresets.json
+
+{
+  "version": 4,
+  "configurePresets": [
+    {
+      "name": "asan",
+      "generator": "Ninja",
+      "binaryDir": "build/asan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "ENABLE_ASAN": "ON",
+        "ENABLE_UBSAN": "ON"
+      }
+    },
+    {
+      "name": "tsan",
+      "generator": "Ninja",
+      "binaryDir": "build/tsan",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "ENABLE_TSAN": "ON" }
+    }
+  ]
+}
+
+CTest（讓 sanitizer 失敗時測試直接紅）
+
+enable_testing()
+add_test(NAME run_app COMMAND app)
+set_tests_properties(run_app PROPERTIES
+  ENVIRONMENT "ASAN_OPTIONS=detect_leaks=1:halt_on_error=1;UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1")
+
+
+⸻
+
+4) 執行時的小撇步（Linux）
+	•	Clang 符號化（如果沒自動偵測到）：
+export ASAN_SYMBOLIZER_PATH=$(command -v llvm-symbolizer)
+	•	常用選項：
+	•	ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:strict_string_checks=1
+	•	UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+	•	TSAN_OPTIONS=halt_on_error=1:suppressions=tsan.supp
+	•	抑制檔（LSan/TSan）：
+	•	LSAN_OPTIONS=suppressions=lsan.supp
+	•	tsan.supp 範例：race:std::cout（忽略已知第三方競態）
+
+⸻
+
+5) 常見雷區 & 建議
+	•	不要同時開 ASan 與 TSan（互斥）。ASan+UBSan 是黃金組合；TSan 請單獨一個 preset。
+	•	-O1/-g/-fno-omit-frame-pointer 方便定位；Release 最少也用 RelWithDebInfo。
+	•	第三方靜態庫常會報假陽性或缺符號；必要時只對你的 target 開 sanitizer。
+	•	MSan（MemorySanitizer） 需要「全鏈」皆以 MSan 編譯（含 libc），一般不建議。
+	•	若遇到 stack-use-after-return 難抓，可再加 -fsanitize-address-use-after-return=always（Clang）。
+	•	CMake 3.13 以前沒有 target_link_options，可退而求其次用 set(CMAKE_EXE_LINKER_FLAGS ...)。
+
+⸻
+
+6) 與你的 Kernel 模組開發節奏搭配
+	•	把「核心邏輯」用我前一則給你的 OS shim 分層，在 user space 開 ASan/UBSan 用 GDB 把 bug 抓乾淨，再把同一套 core 丟進 .ko。
+	•	若要 fuzz，Clang 再加 -fsanitize=fuzzer,address,undefined，配合 libFuzzer 建 target；找到的最小化樣本可做 KUnit 測試。
+
+⸻
+
+需要的話，我可以把你現有的 CMake 專案骨架貼過來，幫你直接改成「Presets + Sanitizers + CTest」三件套的模板，含一個最小單元測試與 suppression 範例檔。
+
