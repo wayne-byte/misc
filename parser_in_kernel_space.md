@@ -923,3 +923,44 @@ export ASAN_SYMBOLIZER_PATH=$(command -v llvm-symbolizer)
 
 需要的話，我可以把你現有的 CMake 專案骨架貼過來，幫你直接改成「Presets + Sanitizers + CTest」三件套的模板，含一個最小單元測試與 suppression 範例檔。
 
+
+
+
+
+#include <vector>
+#include <string>
+#include <fstream>
+#include <span>
+#include <filesystem>
+#include <cstddef> // std::byte
+
+struct ByteView {
+    std::span<const std::byte> view;
+    // 快捷：取得 C 風格指標與大小
+    const void* data() const { return view.data(); }
+    size_t size() const { return view.size(); }
+};
+
+// 讀檔到 vector，順便提供只讀 view
+inline std::pair<std::vector<std::byte>, ByteView>
+read_file_owned(const std::string& path) {
+    namespace fs = std::filesystem;
+    std::vector<std::byte> buf;
+
+    const auto sz = fs::file_size(path);               // 失敗會丟例外，可改 try/catch
+    buf.resize(static_cast<size_t>(sz));
+
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) throw std::runtime_error("open failed: " + path);
+    ifs.read(reinterpret_cast<char*>(buf.data()), buf.size());
+    if (static_cast<size_t>(ifs.gcount()) != buf.size())
+        throw std::runtime_error("short read: " + path);
+
+    ByteView view{ std::span<const std::byte>(buf.data(), buf.size()) };
+    return { std::move(buf), view };
+}
+
+// 用法
+// auto [storage, view] = read_file_owned("foo.bin");
+// const uint8_t* p = reinterpret_cast<const uint8_t*>(view.data());
+// size_t n = view.size();
