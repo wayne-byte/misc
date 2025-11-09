@@ -927,120 +927,113 @@ export ASAN_SYMBOLIZER_PATH=$(command -v llvm-symbolizer)
 
 
 
-#include <vector>
-#include <string>
-#include <fstream>
-#include <span>
-#include <filesystem>
-#include <cstddef> // std::byte
+我不需要這麼多
+mvpu_u64map 我只需要以下:
+mvpu_u64map_create
+mvpu_u64map_destroy
+mvpu_u64map_clear
+mvpu_u64map_set
+mvpu_u64map_get
+mvpu_u64map_erase
+mvpu_u64map_alloc
+mvpu_u64map_foreach
+再加上 mvpu_u64map_remove
 
-struct ByteView {
-    std::span<const std::byte> view;
-    // 快捷：取得 C 風格指標與大小
-    const void* data() const { return view.data(); }
-    size_t size() const { return view.size(); }
-};
-
-// 讀檔到 vector，順便提供只讀 view
-inline std::pair<std::vector<std::byte>, ByteView>
-read_file_owned(const std::string& path) {
-    namespace fs = std::filesystem;
-    std::vector<std::byte> buf;
-
-    const auto sz = fs::file_size(path);               // 失敗會丟例外，可改 try/catch
-    buf.resize(static_cast<size_t>(sz));
-
-    std::ifstream ifs(path, std::ios::binary);
-    if (!ifs) throw std::runtime_error("open failed: " + path);
-    ifs.read(reinterpret_cast<char*>(buf.data()), buf.size());
-    if (static_cast<size_t>(ifs.gcount()) != buf.size())
-        throw std::runtime_error("short read: " + path);
-
-    ByteView view{ std::span<const std::byte>(buf.data(), buf.size()) };
-    return { std::move(buf), view };
-}
-
-// 用法
-// auto [storage, view] = read_file_owned("foo.bin");
-// const uint8_t* p = reinterpret_cast<const uint8_t*>(view.data());
-// size_t n = view.size();
+mvpu_u64map 我只需要以下:
+create
+destroy
+clear
+push_back
+pop_back
+front
+size
+empty
+erase_first
+remove_if
+foreach
 
 
 
+好的，我照你要的「精簡版 API」重寫成三個檔案：**C 介面 (`mvpu_ds.h`)**、**Kernel 後端 (`mvpu_ds_kernel.c`)**、**User 後端 (`mvpu_ds_user.cpp`)**。
+功能只包含你列的那些：
 
+* `mvpu_u64map`：`create/destroy/clear/set/get/erase/alloc/foreach/remove`
+* `mvpu_list`：`create/destroy/clear/push_back/pop_back/front/size/empty/erase_first/remove_if/foreach`
 
-
-
-
-
-
-
-
-
-好的，我幫你做一套「**C 介面 + 兩個後端實作**」的最小框架：
-
-* **介面（.h）**：純 C，穩定 ABI，可同時被 kernel 與 user 端 include。
-* **Kernel 後端（.c）**：用 Linux 內建 DS（`xarray` / `rhashtable`）。
-* **User 後端（.cpp）**：用 `std::unordered_map`，但仍輸出 **C 函式**（`extern "C"`），所以你的上層邏輯**只寫 C**。
-
-我先給兩種 Map（`u64 → void*`、`string → void*`）與一個簡單 vector（指標動態陣列）。你可以直接複製到專案。
+> 說明：
+>
+> * `destroy/clear/remove/remove_if` 都可傳入 `val_dtor`（可為 `NULL`）；若提供，容器會對被移除的 **value** 逐一呼叫它（map 的 value、list 的節點值）。
+> * `foreach` 的 callback 回非 0 會提前中止，該值會直接回傳給呼叫端。
+> * **Kernel 端的 `u64map_remove`** 會先收集 key 再刪（避免迭代中修改 xarray）。
+> * 單執行緒假設（你之前提到 OneThread）；若有 RCU 讀者，請把 `val_dtor` 換成 `kfree_rcu()` 版。
 
 ---
 
-# 檔案 1：`mvpu_ds.h`（C 介面；兩端共用）
+## 檔案：`mvpu_ds.h`（C 介面）
 
 ```c
 #pragma once
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* ---------- 前置宣告（opaque） ---------- */
+/* ===================== mvpu_u64map ===================== */
 typedef struct mvpu_u64map mvpu_u64map;
-typedef struct mvpu_strmap mvpu_strmap;
-typedef struct mvpu_vec    mvpu_vec;
 
-/* ---------- u64 → void* map ---------- */
-typedef int (*mvpu_u64map_foreach_fn)(unsigned long key, void *val, void *ctx);
-
+/* dtor 可為 NULL；若提供，clear/destroy/remove 會對移除的 value 呼叫 dtor(val) */
 mvpu_u64map* mvpu_u64map_create(void);
-void         mvpu_u64map_destroy(mvpu_u64map* m);
+void         mvpu_u64map_destroy(mvpu_u64map* m, void (*val_dtor)(void*));
+void         mvpu_u64map_clear  (mvpu_u64map* m, void (*val_dtor)(void*));
 
-/* 覆蓋或插入；成功 0、失敗 -errno */
-int          mvpu_u64map_set(mvpu_u64map* m, unsigned long key, void *val);
-void*        mvpu_u64map_get(const mvpu_u64map* m, unsigned long key);  /* NULL=無 */
-void*        mvpu_u64map_erase(mvpu_u64map* m, unsigned long key);      /* 回舊值或 NULL */
+/* 0 / -errno；erase 回舊值（不呼叫 dtor）或 NULL；get 回 value 或 NULL */
+int          mvpu_u64map_set   (mvpu_u64map* m, unsigned long key, void *val);
+void*        mvpu_u64map_get   (const mvpu_u64map* m, unsigned long key);
+void*        mvpu_u64map_erase (mvpu_u64map* m, unsigned long key);
 
-/* 分配一顆新 ID（min..max，或循環） */
-int          mvpu_u64map_alloc(mvpu_u64map* m, unsigned long* out_key, void* val,
-                               unsigned long min_key, unsigned long max_key);
-int          mvpu_u64map_alloc_cyclic(mvpu_u64map* m, unsigned long* out_key, void* val,
-                               unsigned long min_key, unsigned long max_key,
-                               unsigned long* next_key);
+/* 在 [min,max] 找空洞配一個 key（以 value 存入），成功回 0 並輸出 out_key */
+int          mvpu_u64map_alloc (mvpu_u64map* m, unsigned long* out_key, void* val,
+                                unsigned long min_key, unsigned long max_key);
 
-/* 迭代：callback 回非 0 會中止並把該值回傳 */
-int          mvpu_u64map_foreach(mvpu_u64map* m, mvpu_u64map_foreach_fn fn, void* ctx);
+/* foreach：cb 回非 0 會提前中止並把該值回傳 */
+typedef int (*mvpu_u64map_foreach_fn)(unsigned long key, void *val, void *ctx);
+int          mvpu_u64map_foreach(mvpu_u64map* m, mvpu_u64map_foreach_fn cb, void* ctx);
 
-/* ---------- string → void* map ---------- */
-/* 介面做成「自動複製 key（C 字串）」：user=std::string；kernel=kstrdup。*/
-typedef int (*mvpu_strmap_foreach_fn)(const char *key, void *val, void *ctx);
+/* remove：pred(key,val,ctx)=true 的項目會被刪除；若提供 dtor，會對被刪 value 呼叫之。
+ * 回傳移除數量。 */
+typedef bool (*mvpu_u64map_pred_fn)(unsigned long key, void *val, void *ctx);
+size_t       mvpu_u64map_remove(mvpu_u64map* m,
+                                mvpu_u64map_pred_fn pred, void* ctx,
+                                void (*val_dtor)(void*));
 
-mvpu_strmap* mvpu_strmap_create(void);
-void         mvpu_strmap_destroy(mvpu_strmap* m);
-int          mvpu_strmap_set(mvpu_strmap* m, const char* key_cstr, void* val); /* 內部複製 key */
-void*        mvpu_strmap_get(const mvpu_strmap* m, const char* key_cstr);
-void*        mvpu_strmap_erase(mvpu_strmap* m, const char* key_cstr);          /* 回舊值或 NULL */
-int          mvpu_strmap_foreach(mvpu_strmap* m, mvpu_strmap_foreach_fn fn, void* ctx);
+/* ===================== mvpu_list（non-intrusive, void*） ===================== */
+typedef struct mvpu_list mvpu_list;
 
-/* ---------- 指標 vector（最小版） ---------- */
-mvpu_vec*    mvpu_vec_create(void);
-void         mvpu_vec_destroy(mvpu_vec* v);
-int          mvpu_vec_push(mvpu_vec* v, void* p);   /* 0/-errno */
-size_t       mvpu_vec_size(const mvpu_vec* v);
-void**       mvpu_vec_data(mvpu_vec* v);            /* 連續儲存的指標陣列 */
+mvpu_list*   mvpu_list_create(void);
+void         mvpu_list_destroy(mvpu_list* lst, void (*val_dtor)(void*));
+void         mvpu_list_clear  (mvpu_list* lst, void (*val_dtor)(void*));
+
+int          mvpu_list_push_back(mvpu_list* lst, void* val);  /* 0/-errno */
+void*        mvpu_list_pop_back (mvpu_list* lst);             /* 回值（不呼叫 dtor）或 NULL */
+void*        mvpu_list_front    (const mvpu_list* lst);
+
+size_t       mvpu_list_size (const mvpu_list* lst);
+bool         mvpu_list_empty(const mvpu_list* lst);
+
+/* 依指標等值移除第一個；回被移除值（不呼叫 dtor）或 NULL */
+void*        mvpu_list_erase_first(mvpu_list* lst, void* val);
+
+/* 依條件移除；pred(val,ctx)=true 就刪。若提供 dtor，會對被刪值呼叫之；回刪除數量。 */
+typedef bool (*mvpu_list_pred_fn)(void* val, void* ctx);
+size_t       mvpu_list_remove_if(mvpu_list* lst, mvpu_list_pred_fn pred, void* ctx,
+                                 void (*val_dtor)(void*));
+
+/* foreach：cb 回非 0 會提前中止並把該值回傳 */
+typedef int (*mvpu_list_foreach_fn)(void* val, void* ctx);
+int          mvpu_list_foreach(mvpu_list* lst, mvpu_list_foreach_fn cb, void* ctx);
 
 #ifdef __cplusplus
 } /* extern "C" */
@@ -1049,19 +1042,17 @@ void**       mvpu_vec_data(mvpu_vec* v);            /* 連續儲存的指標陣�
 
 ---
 
-# 檔案 2：`mvpu_ds_kernel.c`（Kernel 後端：C 實作）
-
-> 放進你的 .ko；用 **Android/Linux 內建 DS**：`xarray`（整數鍵）＋ `rhashtable`（字串鍵）。
+## 檔案：`mvpu_ds_kernel.c`（Kernel 後端，C）
 
 ```c
 // SPDX-License-Identifier: GPL-2.0
+#include "mvpu_ds.h"
 #include <linux/slab.h>
 #include <linux/xarray.h>
-#include <linux/rhashtable.h>
-#include <linux/string.h>
-#include "mvpu_ds.h"
+#include <linux/list.h>
+#include <linux/limits.h>
 
-/* ---------------- u64map (xarray) ---------------- */
+/* -------- mvpu_u64map：xarray -------- */
 struct mvpu_u64map { struct xarray xa; };
 
 mvpu_u64map* mvpu_u64map_create(void)
@@ -1072,11 +1063,29 @@ mvpu_u64map* mvpu_u64map_create(void)
     return m;
 }
 
-void mvpu_u64map_destroy(mvpu_u64map* m)
+static void __u64map_clear(struct xarray *xa, void (*val_dtor)(void*))
+{
+    unsigned long idx = 0;
+    void *entry;
+    while ((entry = xa_find(xa, &idx, ULONG_MAX, XA_PRESENT))) {
+        void *old = xa_erase(xa, idx);
+        if (val_dtor && old) val_dtor(old);
+        idx++;
+    }
+}
+
+void mvpu_u64map_destroy(mvpu_u64map* m, void (*val_dtor)(void*))
 {
     if (!m) return;
-    xa_destroy(&m->xa); /* 只釋放樹節點；不會 free entries（呼叫端自理） */
+    __u64map_clear(&m->xa, val_dtor);
+    xa_destroy(&m->xa);
     kfree(m);
+}
+
+void mvpu_u64map_clear(mvpu_u64map* m, void (*val_dtor)(void*))
+{
+    if (!m) return;
+    __u64map_clear(&m->xa, val_dtor);
 }
 
 int mvpu_u64map_set(mvpu_u64map* m, unsigned long key, void* val)
@@ -1101,330 +1110,673 @@ int mvpu_u64map_alloc(mvpu_u64map* m, unsigned long* out_key, void* val,
     return xa_alloc(&m->xa, out_key, val, XA_LIMIT(min_key, max_key), GFP_KERNEL);
 }
 
-int mvpu_u64map_alloc_cyclic(mvpu_u64map* m, unsigned long* out_key, void* val,
-                      unsigned long min_key, unsigned long max_key,
-                      unsigned long* next_key)
+int mvpu_u64map_foreach(mvpu_u64map* m, mvpu_u64map_foreach_fn cb, void* ctx)
 {
-    return xa_alloc_cyclic(&m->xa, out_key, val, XA_LIMIT(min_key, max_key),
-                           next_key, GFP_KERNEL);
-}
-
-int mvpu_u64map_foreach(mvpu_u64map* m, mvpu_u64map_foreach_fn fn, void* ctx)
-{
-    unsigned long idx; void* entry;
-    xa_for_each(&m->xa, idx, entry) {
-        int r = fn(idx, entry, ctx);
+    if (!m || !cb) return 0;
+    unsigned long k; void *v;
+    xa_for_each(&m->xa, k, v) {
+        int r = cb(k, v, ctx);
         if (r) return r;
     }
     return 0;
 }
 
-/* ---------------- strmap (rhashtable) ---------------- */
-struct mvpu_strnode {
-    char* key;               /* kstrdup 取得，erase/destroy 時 kfree */
-    void* val;
-    struct rhash_head node;
-};
-
-struct mvpu_strmap {
-    struct rhashtable ht;
-    struct rhashtable_params p;
-};
-
-static u32 mvpu_str_hash(const void *data, u32 len, u32 seed)
+/* 先收 key 再刪，避免迭代期間修改 xarray */
+size_t mvpu_u64map_remove(mvpu_u64map* m,
+                          mvpu_u64map_pred_fn pred, void* ctx,
+                          void (*val_dtor)(void*))
 {
-    /* data = &node->key（指向 char*）；len 用不到，直接對字串做 djb2/jenkins 都可 */
-    const char * const *pk = data;
-    const unsigned char *s = (const unsigned char *)(*pk);
-    u32 h = seed ? seed : 5381;
-    while (*s) h = ((h << 5) + h) + *s++;
-    return h;
-}
+    if (!m || !pred) return 0;
 
-static int mvpu_str_cmp(struct rhashtable_compare_arg *arg, const void *obj)
-{
-    const char *key = *(const char **)arg->key;   /* key 指向 char* */
-    const struct mvpu_strnode *n = obj;
-    return strcmp(key, n->key);
-}
+    struct key_node { struct list_head link; unsigned long k; };
+    LIST_HEAD(keys);
+    size_t n = 0;
 
-mvpu_strmap* mvpu_strmap_create(void)
-{
-    mvpu_strmap* m = kzalloc(sizeof(*m), GFP_KERNEL);
-    if (!m) return NULL;
-    m->p = (struct rhashtable_params){
-        .head_offset = offsetof(struct mvpu_strnode, node),
-        .key_offset  = offsetof(struct mvpu_strnode, key),
-        .key_len     = sizeof(char*),              /* 我們把 key 當指標來比較 */
-        .hashfn      = mvpu_str_hash,
-        .obj_cmpfn   = mvpu_str_cmp,
-        .automatic_shrinking = true,
-    };
-    if (rhashtable_init(&m->ht, &m->p)) { kfree(m); return NULL; }
-    return m;
-}
-
-void mvpu_strmap_destroy(mvpu_strmap* m)
-{
-    if (!m) return;
-    /* 走訪並移除所有節點 */
-    struct rhashtable_iter it;
-    if (!rhashtable_walk_init(&m->ht, &it, GFP_KERNEL)) {
-        rhashtable_walk_start(&it);
-        while (1) {
-            struct mvpu_strnode *n = rhashtable_walk_next(&it);
-            if (!n) break;
-            if (IS_ERR(n)) {
-                if (PTR_ERR(n) == -EAGAIN) continue;
-                break;
+    /* 收集 */
+    {
+        unsigned long k; void *v;
+        xa_for_each(&m->xa, k, v) {
+            if (pred(k, v, ctx)) {
+                struct key_node *kn = kmalloc(sizeof(*kn), GFP_KERNEL);
+                if (!kn) break;
+                kn->k = k;
+                list_add_tail(&kn->link, &keys);
             }
-            rhashtable_remove_fast(&m->ht, &n->node, m->p);
-            kfree(n->key);
-            kfree(n);
         }
-        rhashtable_walk_stop(&it);
-        rhashtable_walk_exit(&it);
     }
-    rhashtable_destroy(&m->ht);
-    kfree(m);
+
+    /* 刪除 */
+    while (!list_empty(&keys)) {
+        struct key_node *kn = list_first_entry(&keys, struct key_node, link);
+        list_del(&kn->link);
+        void *old = xa_erase(&m->xa, kn->k);
+        if (val_dtor && old) val_dtor(old);
+        kfree(kn);
+        n++;
+    }
+    return n;
 }
 
-int mvpu_strmap_set(mvpu_strmap* m, const char* key_cstr, void* val)
-{
-    /* 查既有；存在就覆蓋，不存在就插入新 node（複製 key） */
-    const char *lookup_key = key_cstr;
-    struct mvpu_strnode *old = rhashtable_lookup(&m->ht, &lookup_key, m->p);
-    if (old) { old->val = val; return 0; }
+/* -------- mvpu_list：list_head + kmalloc 節點 -------- */
+struct mvpu_list_node { struct list_head link; void *val; };
+struct mvpu_list { struct list_head head; size_t sz; };
 
-    struct mvpu_strnode *n = kzalloc(sizeof(*n), GFP_KERNEL);
+mvpu_list* mvpu_list_create(void)
+{
+    struct mvpu_list *lst = kzalloc(sizeof(*lst), GFP_KERNEL);
+    if (!lst) return NULL;
+    INIT_LIST_HEAD(&lst->head);
+    lst->sz = 0;
+    return lst;
+}
+
+static void __list_free_all(struct mvpu_list *lst, void (*dtor)(void*))
+{
+    struct mvpu_list_node *n, *tmp;
+    list_for_each_entry_safe(n, tmp, &lst->head, link) {
+        list_del(&n->link);
+        if (dtor && n->val) dtor(n->val);
+        kfree(n);
+    }
+    lst->sz = 0;
+}
+
+void mvpu_list_destroy(mvpu_list* lst, void (*val_dtor)(void*))
+{
+    if (!lst) return;
+    __list_free_all(lst, val_dtor);
+    kfree(lst);
+}
+
+void mvpu_list_clear(mvpu_list* lst, void (*val_dtor)(void*))
+{
+    if (!lst) return;
+    __list_free_all(lst, val_dtor);
+}
+
+int mvpu_list_push_back(mvpu_list* lst, void* val)
+{
+    struct mvpu_list_node *n = kmalloc(sizeof(*n), GFP_KERNEL);
     if (!n) return -ENOMEM;
-    n->key = kstrdup(key_cstr, GFP_KERNEL);
-    if (!n->key) { kfree(n); return -ENOMEM; }
     n->val = val;
-
-    return rhashtable_insert_fast(&m->ht, &n->node, m->p);
+    list_add_tail(&n->link, &lst->head);
+    lst->sz++;
+    return 0;
 }
 
-void* mvpu_strmap_get(const mvpu_strmap* m, const char* key_cstr)
+void* mvpu_list_pop_back(mvpu_list* lst)
 {
-    const char *lookup_key = key_cstr;
-    struct mvpu_strnode *n = rhashtable_lookup((struct rhashtable *)&m->ht, &lookup_key, m->p);
-    return n ? n->val : NULL;
-}
-
-void* mvpu_strmap_erase(mvpu_strmap* m, const char* key_cstr)
-{
-    const char *lookup_key = key_cstr;
-    struct mvpu_strnode *n = rhashtable_lookup(&m->ht, &lookup_key, m->p);
-    if (!n) return NULL;
-    rhashtable_remove_fast(&m->ht, &n->node, m->p);
-    void* v = n->val;
-    kfree(n->key);
+    if (!lst || list_empty(&lst->head)) return NULL;
+    struct mvpu_list_node *n = list_last_entry(&lst->head, struct mvpu_list_node, link);
+    void *v = n->val;
+    list_del(&n->link);
     kfree(n);
+    lst->sz--;
     return v;
 }
 
-int mvpu_strmap_foreach(mvpu_strmap* m, int (*fn)(const char*, void*, void*), void* ctx)
+void* mvpu_list_front(const mvpu_list* lst)
 {
-    struct rhashtable_iter it;
-    int ret = rhashtable_walk_init(&m->ht, &it, GFP_KERNEL);
-    if (ret) return ret;
-    rhashtable_walk_start(&it);
-    while (1) {
-        struct mvpu_strnode *n = rhashtable_walk_next(&it);
-        if (!n) break;
-        if (IS_ERR(n)) { if (PTR_ERR(n)==-EAGAIN) continue; ret = PTR_ERR(n); break; }
-        ret = fn(n->key, n->val, ctx);
+    if (!lst || list_empty(&lst->head)) return NULL;
+    return list_first_entry(&lst->head, struct mvpu_list_node, link)->val;
+}
+
+size_t mvpu_list_size (const mvpu_list* lst){ return lst? lst->sz : 0; }
+bool   mvpu_list_empty(const mvpu_list* lst){ return !lst || list_empty(&lst->head); }
+
+void* mvpu_list_erase_first(mvpu_list* lst, void* val)
+{
+    if (!lst) return NULL;
+    struct mvpu_list_node *n;
+    list_for_each_entry(n, &lst->head, link) {
+        if (n->val == val) {
+            void *v = n->val;
+            list_del(&n->link);
+            kfree(n);
+            lst->sz--;
+            return v;
+        }
+    }
+    return NULL;
+}
+
+size_t mvpu_list_remove_if(mvpu_list* lst, mvpu_list_pred_fn pred, void* ctx,
+                           void (*val_dtor)(void*))
+{
+    if (!lst || !pred) return 0;
+    size_t removed = 0;
+    struct mvpu_list_node *n, *tmp;
+    list_for_each_entry_safe(n, tmp, &lst->head, link) {
+        if (pred(n->val, ctx)) {
+            list_del(&n->link);
+            if (val_dtor && n->val) val_dtor(n->val);
+            kfree(n);
+            lst->sz--;
+            removed++;
+        }
+    }
+    return removed;
+}
+
+int mvpu_list_foreach(mvpu_list* lst, mvpu_list_foreach_fn cb, void* ctx)
+{
+    if (!lst || !cb) return 0;
+    int ret = 0;
+    struct mvpu_list_node *n, *tmp;
+    list_for_each_entry_safe(n, tmp, &lst->head, link) {
+        ret = cb(n->val, ctx);
         if (ret) break;
     }
-    rhashtable_walk_stop(&it);
-    rhashtable_walk_exit(&it);
     return ret;
 }
-
-/* ---------------- vector（ptr 動態陣列） ---------------- */
-struct mvpu_vec { void** a; size_t sz, cap; };
-
-mvpu_vec* mvpu_vec_create(void)
-{
-    return kzalloc(sizeof(struct mvpu_vec), GFP_KERNEL);
-}
-void mvpu_vec_destroy(mvpu_vec* v)
-{
-    if (!v) return;
-    kfree(v->a);
-    kfree(v);
-}
-static int mvpu_vec_reserve(mvpu_vec* v, size_t need)
-{
-    if (need <= v->cap) return 0;
-    size_t nc = v->cap ? v->cap*2 : 8;
-    while (nc < need) {
-        if (nc > (SIZE_MAX/2)) return -EOVERFLOW;
-        nc *= 2;
-    }
-    void** nd = krealloc(v->a, nc*sizeof(void*), GFP_KERNEL);
-    if (!nd) return -ENOMEM;
-    v->a = nd; v->cap = nc; return 0;
-}
-int mvpu_vec_push(mvpu_vec* v, void* p)
-{
-    if (v->sz == v->cap) { int r=mvpu_vec_reserve(v, v->cap? v->cap*2:8); if (r) return r; }
-    v->a[v->sz++] = p; return 0;
-}
-size_t mvpu_vec_size(const mvpu_vec* v) { return v->sz; }
-void** mvpu_vec_data(mvpu_vec* v) { return v->a; }
 ```
 
 ---
 
-# 檔案 3：`mvpu_ds_user.cpp`（User 後端：C++ 實作但暴露 C 函式）
-
-> 這邊用 `std::unordered_map`／`std::string`，但對外仍是 **C 介面**。你在 user 測試可以直接連這個 `.cpp`，在 kernel 連 `.c`。
+## 檔案：`mvpu_ds_user.cpp`（User 後端，C++，但輸出 C 介面）
 
 ```cpp
-// user-side implementation
-#include <unordered_map>
-#include <string>
-#include <vector>
-#include <new>
 #include "mvpu_ds.h"
+#include <unordered_map>
+#include <list>
+#include <new>
 
 extern "C" {
 
-/* ---------------- u64map ---------------- */
+/* -------- mvpu_u64map：unordered_map -------- */
 struct mvpu_u64map { std::unordered_map<unsigned long, void*> m; };
 
 mvpu_u64map* mvpu_u64map_create(void) { return new (std::nothrow) mvpu_u64map{}; }
-void mvpu_u64map_destroy(mvpu_u64map* m) { delete m; }
 
-int   mvpu_u64map_set(mvpu_u64map* m, unsigned long key, void* val) { m->m[key]=val; return 0; }
-void* mvpu_u64map_get(const mvpu_u64map* m, unsigned long key) {
+static void __u64map_clear(mvpu_u64map* m, void (*val_dtor)(void*))
+{
+    if (!m) return;
+    if (val_dtor) for (auto &kv : m->m) if (kv.second) val_dtor(kv.second);
+    m->m.clear();
+}
+
+void mvpu_u64map_destroy(mvpu_u64map* m, void (*val_dtor)(void*))
+{
+    if (!m) return;
+    __u64map_clear(m, val_dtor);
+    delete m;
+}
+
+void mvpu_u64map_clear(mvpu_u64map* m, void (*val_dtor)(void*))
+{
+    __u64map_clear(m, val_dtor);
+}
+
+int   mvpu_u64map_set(mvpu_u64map* m, unsigned long key, void* val)
+{
+    m->m[key] = val; return 0;
+}
+
+void* mvpu_u64map_get(const mvpu_u64map* m, unsigned long key)
+{
     auto it = m->m.find(key); return it==m->m.end()? nullptr : it->second;
 }
-void* mvpu_u64map_erase(mvpu_u64map* m, unsigned long key) {
+
+void* mvpu_u64map_erase(mvpu_u64map* m, unsigned long key)
+{
     auto it = m->m.find(key); if (it==m->m.end()) return nullptr;
     void* v = it->second; m->m.erase(it); return v;
 }
+
 int mvpu_u64map_alloc(mvpu_u64map* m, unsigned long* out_key, void* val,
                       unsigned long min_key, unsigned long max_key)
 {
-    static unsigned long next = 0;  // 單執行緒簡易策略
+    static unsigned long next = 0;
     if (next < min_key || next > max_key) next = min_key;
-    return mvpu_u64map_alloc_cyclic(m, out_key, val, min_key, max_key, &next);
-}
-int mvpu_u64map_alloc_cyclic(mvpu_u64map* m, unsigned long* out_key, void* val,
-                      unsigned long min_key, unsigned long max_key,
-                      unsigned long* next_key)
-{
-    unsigned long k = (*next_key<min_key || *next_key>max_key) ? min_key : *next_key;
-    unsigned long start = k;
+    unsigned long k = next, start = next;
     do {
-        if (!mvpu_u64map_get(m, k)) { m->m[k]=val; *out_key=k; *next_key = (k==max_key?min_key:k+1); return 0; }
+        if (!mvpu_u64map_get(m, k)) {
+            m->m[k] = val; *out_key = k; next = (k==max_key? min_key : k+1); return 0;
+        }
         k = (k==max_key? min_key : k+1);
     } while (k != start);
     return -28; /* -ENOSPC */
 }
-int mvpu_u64map_foreach(mvpu_u64map* m, mvpu_u64map_foreach_fn fn, void* ctx)
+
+int mvpu_u64map_foreach(mvpu_u64map* m, mvpu_u64map_foreach_fn cb, void* ctx)
 {
-    for (auto &kv : m->m) { int r = fn(kv.first, kv.second, ctx); if (r) return r; }
+    if (!m || !cb) return 0;
+    for (auto &kv : m->m) { int r = cb(kv.first, kv.second, ctx); if (r) return r; }
     return 0;
 }
 
-/* ---------------- strmap ---------------- */
-struct mvpu_strmap { std::unordered_map<std::string, void*> m; };
-
-mvpu_strmap* mvpu_strmap_create(void) { return new (std::nothrow) mvpu_strmap{}; }
-void mvpu_strmap_destroy(mvpu_strmap* m) { delete m; }
-
-int   mvpu_strmap_set(mvpu_strmap* m, const char* key_cstr, void* val) {
-    m->m[std::string(key_cstr)] = val; return 0;
-}
-void* mvpu_strmap_get(const mvpu_strmap* m, const char* key_cstr) {
-    auto it = m->m.find(key_cstr); return it==m->m.end()? nullptr : it->second;
-}
-void* mvpu_strmap_erase(mvpu_strmap* m, const char* key_cstr) {
-    auto it = m->m.find(key_cstr); if (it==m->m.end()) return nullptr;
-    void* v = it->second; m->m.erase(it); return v;
-}
-int mvpu_strmap_foreach(mvpu_strmap* m, int (*fn)(const char*, void*, void*), void* ctx)
+size_t mvpu_u64map_remove(mvpu_u64map* m,
+                          mvpu_u64map_pred_fn pred, void* ctx,
+                          void (*val_dtor)(void*))
 {
-    for (auto &kv : m->m){ int r = fn(kv.first.c_str(), kv.second, ctx); if (r) return r; }
+    if (!m || !pred) return 0;
+    size_t removed = 0;
+    for (auto it = m->m.begin(); it != m->m.end(); ) {
+        if (pred(it->first, it->second, ctx)) {
+            if (val_dtor && it->second) val_dtor(it->second);
+            it = m->m.erase(it);
+            removed++;
+        } else {
+            ++it;
+        }
+    }
+    return removed;
+}
+
+/* -------- mvpu_list：std::list<void*> -------- */
+struct mvpu_list { std::list<void*> L; };
+
+mvpu_list* mvpu_list_create(void) { return new (std::nothrow) mvpu_list{}; }
+
+void mvpu_list_destroy(mvpu_list* lst, void (*val_dtor)(void*))
+{
+    if (!lst) return;
+    if (val_dtor) for (void* v : lst->L) if (v) val_dtor(v);
+    delete lst;
+}
+
+void mvpu_list_clear(mvpu_list* lst, void (*val_dtor)(void*))
+{
+    if (!lst) return;
+    if (val_dtor) for (void* v : lst->L) if (v) val_dtor(v);
+    lst->L.clear();
+}
+
+int mvpu_list_push_back(mvpu_list* lst, void* val) { lst->L.push_back(val); return 0; }
+
+void* mvpu_list_pop_back(mvpu_list* lst)
+{
+    if (!lst || lst->L.empty()) return nullptr;
+    void* v = lst->L.back(); lst->L.pop_back(); return v;
+}
+
+void* mvpu_list_front(const mvpu_list* lst)
+{
+    return (lst && !lst->L.empty())? lst->L.front() : nullptr;
+}
+
+size_t mvpu_list_size (const mvpu_list* lst){ return lst? lst->L.size():0; }
+bool   mvpu_list_empty(const mvpu_list* lst){ return !lst || lst->L.empty(); }
+
+void* mvpu_list_erase_first(mvpu_list* lst, void* val)
+{
+    if (!lst) return nullptr;
+    for (auto it = lst->L.begin(); it != lst->L.end(); ++it) {
+        if (*it == val) { void* v = *it; lst->L.erase(it); return v; }
+    }
+    return nullptr;
+}
+
+size_t mvpu_list_remove_if(mvpu_list* lst, mvpu_list_pred_fn pred, void* ctx,
+                           void (*val_dtor)(void*))
+{
+    if (!lst || !pred) return 0;
+    size_t removed = 0;
+    for (auto it = lst->L.begin(); it != lst->L.end(); ) {
+        if (pred(*it, ctx)) {
+            if (val_dtor && *it) val_dtor(*it);
+            it = lst->L.erase(it);
+            removed++;
+        } else {
+            ++it;
+        }
+    }
+    return removed;
+}
+
+int mvpu_list_foreach(mvpu_list* lst, mvpu_list_foreach_fn cb, void* ctx)
+{
+    if (!lst || !cb) return 0;
+    for (void* v : lst->L) { int r = cb(v, ctx); if (r) return r; }
     return 0;
 }
 
-/* ---------------- vector（ptr） ---------------- */
-struct mvpu_vec { std::vector<void*> v; };
+} // extern "C"
+```
 
-mvpu_vec* mvpu_vec_create(void) { return new (std::nothrow) mvpu_vec{}; }
-void mvpu_vec_destroy(mvpu_vec* v) { delete v; }
-int    mvpu_vec_push(mvpu_vec* v, void* p) { v->v.push_back(p); return 0; }
-size_t mvpu_vec_size(const mvpu_vec* v) { return v->v.size(); }
-void** mvpu_vec_data(mvpu_vec* v) { return v->v.data(); }
+---
+
+如果你要，我可以再附上一個最小 `Kbuild` 與 `Android.bp` 範例；或把 `val_dtor` 改成「必要時才帶」的弱連結函式。但目前這版已可直接放到你的專案，**User/Kernel 兩邊零改碼**使用。
+
+
+
+mvpu_ds_strmap:
+
+``` mvpu_ds_strmap.h
+#pragma once
+#include <linux/types.h>
+#include <linux/stddef.h>
+#include <linux/stdbool.h>
+
+struct mvpu_strmap;
+
+/* 建立 / 銷毀 / 清空 */
+struct mvpu_strmap* mvpu_strmap_create(void);
+void mvpu_strmap_destroy(struct mvpu_strmap* m, void (*val_dtor)(void*));
+void mvpu_strmap_clear(struct mvpu_strmap* m, void (*val_dtor)(void*));
+
+/* 基本 CRUD */
+int   mvpu_strmap_set(struct mvpu_strmap* m, const char *key, void *value);
+void* mvpu_strmap_get(struct mvpu_strmap* m, const char *key);
+void* mvpu_strmap_erase(struct mvpu_strmap* m, const char *key);
+
+/* 遍歷與條件移除 */
+typedef int  (*mvpu_strmap_foreach_fn)(const char *key, void *val, void *ctx);
+typedef bool (*mvpu_strmap_pred_fn)(const char *key, void *val, void *ctx);
+
+int    mvpu_strmap_foreach(struct mvpu_strmap* m, mvpu_strmap_foreach_fn cb, void *ctx);
+size_t mvpu_strmap_remove(struct mvpu_strmap* m,
+                          mvpu_strmap_pred_fn pred, void *ctx,
+                          void (*val_dtor)(void*));
+
+```
+
+``` mvpu_ds_strmap.c
+// SPDX-License-Identifier: GPL-2.0
+#include "mvpu_ds_strmap.h"
+#include <linux/hashtable.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/stringhash.h>
+
+#define MVPU_STRMAP_BITS 6  /* 預設 64 桶，可依需求調整 */
+
+struct mvpu_strmap_entry {
+	struct hlist_node hnode;
+	char *key;
+	void *value;
+};
+
+struct mvpu_strmap {
+	DECLARE_HASHTABLE(table, MVPU_STRMAP_BITS);
+};
+
+/* --- 雜湊與比較 --- */
+static inline u32 mvpu_strmap_hash(const char *key)
+{
+	return full_name_hash(NULL, key, strlen(key));
+}
+
+/* --- 建立與清除 --- */
+struct mvpu_strmap* mvpu_strmap_create(void)
+{
+	struct mvpu_strmap *m = kzalloc(sizeof(*m), GFP_KERNEL);
+	if (!m)
+		return NULL;
+	hash_init(m->table);
+	return m;
+}
+
+void mvpu_strmap_clear(struct mvpu_strmap* m, void (*val_dtor)(void*))
+{
+	struct mvpu_strmap_entry *e;
+	struct hlist_node *tmp;
+	int bkt;
+
+	if (!m)
+		return;
+
+	hash_for_each_safe(m->table, bkt, tmp, e, hnode) {
+		hash_del(&e->hnode);
+		if (val_dtor && e->value)
+			val_dtor(e->value);
+		kfree(e->key);
+		kfree(e);
+	}
+}
+
+void mvpu_strmap_destroy(struct mvpu_strmap* m, void (*val_dtor)(void*))
+{
+	if (!m)
+		return;
+	mvpu_strmap_clear(m, val_dtor);
+	kfree(m);
+}
+
+/* --- set/get/erase --- */
+int mvpu_strmap_set(struct mvpu_strmap* m, const char *key, void *value)
+{
+	if (!m || !key)
+		return -EINVAL;
+
+	u32 hash = mvpu_strmap_hash(key);
+	struct mvpu_strmap_entry *e;
+
+	/* 若已存在則覆蓋 */
+	hash_for_each_possible(m->table, e, hnode, hash) {
+		if (strcmp(e->key, key) == 0) {
+			e->value = value;
+			return 0;
+		}
+	}
+
+	e = kzalloc(sizeof(*e), GFP_KERNEL);
+	if (!e)
+		return -ENOMEM;
+
+	e->key = kstrdup(key, GFP_KERNEL);
+	if (!e->key) {
+		kfree(e);
+		return -ENOMEM;
+	}
+	e->value = value;
+	hash_add(m->table, &e->hnode, hash);
+	return 0;
+}
+
+void* mvpu_strmap_get(struct mvpu_strmap* m, const char *key)
+{
+	if (!m || !key)
+		return NULL;
+
+	u32 hash = mvpu_strmap_hash(key);
+	struct mvpu_strmap_entry *e;
+
+	hash_for_each_possible(m->table, e, hnode, hash)
+		if (strcmp(e->key, key) == 0)
+			return e->value;
+	return NULL;
+}
+
+void* mvpu_strmap_erase(struct mvpu_strmap* m, const char *key)
+{
+	if (!m || !key)
+		return NULL;
+
+	u32 hash = mvpu_strmap_hash(key);
+	struct mvpu_strmap_entry *e;
+
+	hash_for_each_possible(m->table, e, hnode, hash)
+		if (strcmp(e->key, key) == 0) {
+			void *v = e->value;
+			hash_del(&e->hnode);
+			kfree(e->key);
+			kfree(e);
+			return v;
+		}
+	return NULL;
+}
+
+/* --- foreach / remove --- */
+int mvpu_strmap_foreach(struct mvpu_strmap* m, mvpu_strmap_foreach_fn cb, void *ctx)
+{
+	if (!m || !cb)
+		return 0;
+
+	struct mvpu_strmap_entry *e;
+	int bkt;
+	int ret = 0;
+
+	hash_for_each(m->table, bkt, e, hnode) {
+		ret = cb(e->key, e->value, ctx);
+		if (ret)
+			break;
+	}
+	return ret;
+}
+
+size_t mvpu_strmap_remove(struct mvpu_strmap* m,
+                          mvpu_strmap_pred_fn pred, void *ctx,
+                          void (*val_dtor)(void*))
+{
+	if (!m || !pred)
+		return 0;
+
+	struct mvpu_strmap_entry *e;
+	struct hlist_node *tmp;
+	int bkt;
+	size_t removed = 0;
+
+	hash_for_each_safe(m->table, bkt, tmp, e, hnode) {
+		if (pred(e->key, e->value, ctx)) {
+			hash_del(&e->hnode);
+			if (val_dtor && e->value)
+				val_dtor(e->value);
+			kfree(e->key);
+			kfree(e);
+			removed++;
+		}
+	}
+	return removed;
+}
+
+```
+
+``` mvpu_ds_strmap_user.cpp
+#include "mvpu_ds_strmap.h"
+#include <unordered_map>
+#include <string>
+#include <new>
+
+extern "C" {
+
+/* ----------- 結構定義 ----------- */
+struct mvpu_strmap {
+    std::unordered_map<std::string, void*> map;
+};
+
+/* ----------- 建立/清理 ----------- */
+struct mvpu_strmap* mvpu_strmap_create(void)
+{
+    return new (std::nothrow) mvpu_strmap{};
+}
+
+static void __mvpu_strmap_clear(struct mvpu_strmap* m, void (*val_dtor)(void*))
+{
+    if (!m) return;
+    if (val_dtor) {
+        for (auto& kv : m->map)
+            if (kv.second) val_dtor(kv.second);
+    }
+    m->map.clear();
+}
+
+void mvpu_strmap_clear(struct mvpu_strmap* m, void (*val_dtor)(void*))
+{
+    __mvpu_strmap_clear(m, val_dtor);
+}
+
+void mvpu_strmap_destroy(struct mvpu_strmap* m, void (*val_dtor)(void*))
+{
+    if (!m) return;
+    __mvpu_strmap_clear(m, val_dtor);
+    delete m;
+}
+
+/* ----------- set/get/erase ----------- */
+int mvpu_strmap_set(struct mvpu_strmap* m, const char* key, void* value)
+{
+    if (!m || !key) return -1;
+    m->map[std::string(key)] = value;
+    return 0;
+}
+
+void* mvpu_strmap_get(struct mvpu_strmap* m, const char* key)
+{
+    if (!m || !key) return nullptr;
+    auto it = m->map.find(key);
+    return it == m->map.end() ? nullptr : it->second;
+}
+
+void* mvpu_strmap_erase(struct mvpu_strmap* m, const char* key)
+{
+    if (!m || !key) return nullptr;
+    auto it = m->map.find(key);
+    if (it == m->map.end()) return nullptr;
+    void* v = it->second;
+    m->map.erase(it);
+    return v;
+}
+
+/* ----------- foreach/remove ----------- */
+int mvpu_strmap_foreach(struct mvpu_strmap* m, mvpu_strmap_foreach_fn cb, void* ctx)
+{
+    if (!m || !cb) return 0;
+    for (auto& kv : m->map) {
+        int r = cb(kv.first.c_str(), kv.second, ctx);
+        if (r) return r;
+    }
+    return 0;
+}
+
+size_t mvpu_strmap_remove(struct mvpu_strmap* m,
+                          mvpu_strmap_pred_fn pred, void* ctx,
+                          void (*val_dtor)(void*))
+{
+    if (!m || !pred) return 0;
+    size_t removed = 0;
+    for (auto it = m->map.begin(); it != m->map.end(); ) {
+        if (pred(it->first.c_str(), it->second, ctx)) {
+            if (val_dtor && it->second) val_dtor(it->second);
+            it = m->map.erase(it);
+            ++removed;
+        } else {
+            ++it;
+        }
+    }
+    return removed;
+}
 
 } /* extern "C" */
+
 ```
 
----
+``` test.c
+#include "mvpu_ds_strmap.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-## 怎麼用（同一份 C 介面，兩邊零改碼）
+static void val_dtor(void* v) { free(v); }
 
-### Kernel（Kbuild / Android.bp）
-
-* 編你自己的 .ko，把 `mvpu_ds.h` 與 `mvpu_ds_kernel.c` 加進去
-* 在 driver 裡 `#include "mvpu_ds.h"`，直接呼叫 C API
-
-### User（gcc/clang）
-
-* 把 `mvpu_ds.h` 與 `mvpu_ds_user.cpp` 加進你的測試程式
-* 用 C 或 C++ 寫測試都可以（C 程式連 `mvpu_ds_user.cpp` 也 OK，因為是 C 介面）
-* 建議：在 user 端先用 GDB/ASan 把邏輯磨好，再搬進 kernel
-
----
-
-## 設計重點與取捨
-
-* 你提到「**C header + C++ 實作**，無法 header-only」——是合理做法。
-  我這版就是 **C header** +（**kernel: C** / **user: C++**）兩端實作；**上層永遠只 include `mvpu_ds.h`**。
-* **所有權**：Map 只存指標；物件生命週期由呼叫端決定。
-
-  * Kernel：若將來需要 RCU 無鎖讀，再把 erase 改成 `kfree_rcu()` 即可。
-  * User：直接 `delete/free` 你 erase 回來的舊值。
-* **單執行緒假設**：目前 API 不加鎖；你說讀寫只有 OneThread，這樣最簡單。未來要多執行緒，再在上層加鎖或換成 RCU 版本。
-* **字串鍵**：介面選擇「自動複製 key」，避免兩端所有權不一致（user=std::string；kernel=kstrdup）。
-
----
-
-## 小例：上層 C 使用（兩端通用）
-
-```c
-#include "mvpu_ds.h"
-
-struct obj { int v; };
-
-void demo(void)
-{
-    mvpu_u64map* m = mvpu_u64map_create();
-    struct obj *a = /* alloc */;
-    mvpu_u64map_set(m, 42, a);
-
-    struct obj *got = (struct obj*)mvpu_u64map_get(m, 42);
-
-    mvpu_u64map_foreach(m, /*callback*/ [](unsigned long k, void* v, void* ctx)->int{
-        (void)ctx;
-        /* ... */
-        return 0;
-    }, NULL);
-
-    struct obj *old = (struct obj*)mvpu_u64map_erase(m, 42);
-    /* free/delete old */
-    mvpu_u64map_destroy(m);
+static int print_cb(const char* k, void* v, void* ctx) {
+    printf("%s -> %p\n", k, v);
+    return 0;
 }
+
+static bool pred_starts_with_a(const char* k, void* v, void* ctx) {
+    return k[0] == 'a';
+}
+
+int main(void)
+{
+    mvpu_strmap* m = mvpu_strmap_create();
+
+    mvpu_strmap_set(m, "apple", strdup("A"));
+    mvpu_strmap_set(m, "banana", strdup("B"));
+    mvpu_strmap_set(m, "avocado", strdup("AV"));
+
+    printf("banana = %s\n", (char*)mvpu_strmap_get(m, "banana"));
+
+    mvpu_strmap_foreach(m, print_cb, NULL);
+
+    mvpu_strmap_remove(m, pred_starts_with_a, NULL, val_dtor);
+
+    printf("--- after remove ---\n");
+    mvpu_strmap_foreach(m, print_cb, NULL);
+
+    mvpu_strmap_destroy(m, val_dtor);
+    return 0;
+}
+
 ```
-
-> C 檔寫 lambda 不行？那就寫一般的靜態函式當 callback。
-
----
-
-如果你還需要 **C-only 的 user 後端**（不想依賴 C++），我可以把 `mvpu_ds_user.cpp` 改成 **uthash** 或「排序陣列 + 二分」版本；介面完全不變。
-另外，若你要 `vector<T>` 的「型別化版本」，也能用巨集再包一層（跟你前面需求的 `smap.h` 風格類似）。
